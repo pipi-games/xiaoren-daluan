@@ -938,15 +938,22 @@ function startGame() {
   hazardTimer = 0;
   frameCount = 0;
 
-  // 玩家
-  entities.push(makeEntity(playerCharKey, 200, 460, true, 0));
+  // 安全出生点：玩家在左地面，AI分散在各平台上方
+  // 平台布局：左地面 x=0-340 y=540 / 右地面 x=860-1200 y=540
+  //           左中岩台 x=280-480 y=420 / 右中岩台 x=700-900 y=420
+  //           中央废墟 x=490-710 y=340
+  entities.push(makeEntity(playerCharKey, 150, 490, true, 0));
 
-  // 3 个 AI 对手（随机挑 3 个不同角色）
   const others = CHAR_KEYS.filter(k => k !== playerCharKey);
   const aiKeys = others.sort(() => Math.random() - 0.5).slice(0, 3);
-  const spawnX = [600, 850, 400];
+  // AI 出生在三个有平台支撑的位置
+  const aiSpawns = [
+    { x: 960, y: 490 },  // 右地面
+    { x: 360, y: 370 },  // 左中岩台上方
+    { x: 740, y: 370 },  // 右中岩台上方
+  ];
   aiKeys.forEach((key, i) => {
-    entities.push(makeEntity(key, spawnX[i], 460, false, i + 1));
+    entities.push(makeEntity(key, aiSpawns[i].x, aiSpawns[i].y, false, i + 1));
   });
 
   buildHUD();
@@ -1181,9 +1188,9 @@ function update() {
   updateEffects();
   updateHUD();
 
-  // 胜负判断
+  // 胜负判断（至少 3 秒后才判定，避免生成bug导致瞬间结束）
   const alive = entities.filter(e => e.alive);
-  if (alive.length <= 1) {
+  if (alive.length <= 1 && frameCount > 180) {
     if (alive.length === 1) {
       const winner = alive[0];
       const def = CHAR_DEFS[winner.charKey];
