@@ -1,0 +1,982 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta property="og:title" content="小人大乱斗">
+<meta property="og:description" content="5 个角色，废墟峡谷横版对战！">
+<title>小人大乱斗</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+html, body { width: 100%; height: 100%; overflow: hidden; background: #0a0a0f; font-family: -apple-system, sans-serif; user-select: none; }
+canvas { display: block; position: fixed; top: 0; left: 0; image-rendering: pixelated; }
+#ui { position: fixed; top: 0; left: 0; width: 100%; pointer-events: none; z-index: 10; }
+#ui .hud { display: flex; justify-content: center; gap: 24px; padding: 10px; }
+.char-hud { background: rgba(0,0,0,0.55); border-radius: 10px; padding: 6px 14px; min-width: 160px; }
+.char-hud .name { font-size: 14px; font-weight: bold; color: #fff; margin-bottom: 4px; }
+.char-hud .hp-bar { height: 10px; background: #333; border-radius: 5px; overflow: hidden; }
+.char-hud .hp-fill { height: 100%; border-radius: 5px; transition: width .1s; }
+.char-hud .hp-text { font-size: 11px; color: #ccc; margin-top: 2px; }
+#hint { position: fixed; bottom: 10px; left: 50%; transform: translateX(-50%); color: #888; font-size: 12px; pointer-events: none; z-index: 10; }
+</style>
+</head>
+<body>
+<div id="ui"><div class="hud" id="hud"></div></div>
+<canvas id="c"></canvas>
+<div id="hint">WASD/方向键 移动跳跃 · J 普攻 · K 技能1 · L 技能2 · R 重开</div>
+
+<script>
+// ─── 画布 ───────────────────────────────────────────
+const cv = document.getElementById('c');
+const ctx = cv.getContext('2d');
+let W, H, scaleX, scaleY;
+const BASE_W = 1200, BASE_H = 650;
+function resize() {
+  W = window.innerWidth; H = window.innerHeight;
+  cv.width = W; cv.height = H;
+  scaleX = W / BASE_W; scaleY = H / BASE_H;
+}
+resize();
+window.addEventListener('resize', resize);
+
+// ─── 地图 ───────────────────────────────────────────
+// 逻辑坐标用 BASE_W × BASE_H
+const PLATFORMS = [
+  // 地面（左右两段，中间有缺口）
+  { x: 0,   y: 540, w: 340, h: 30, type: 'ground' },
+  { x: 860, y: 540, w: 340, h: 30, type: 'ground' },
+  // 中层平台
+  { x: 280, y: 420, w: 200, h: 20, type: 'rock' },
+  { x: 700, y: 420, w: 200, h: 20, type: 'rock' },
+  { x: 490, y: 340, w: 220, h: 20, type: 'ruin' },
+  // 高层
+  { x: 100, y: 280, w: 160, h: 20, type: 'ruin' },
+  { x: 940, y: 280, w: 160, h: 20, type: 'ruin' },
+  // 顶部石窟（出界判断用洞顶不做平台）
+];
+const GRAVITY = 1.2;
+const BOUNDS = { left: -60, right: BASE_W + 60, bottom: BASE_H + 80 };
+
+// ─── 角色定义 ─────────────────────────────────────
+const CHAR_DEFS = {
+  warrior: {
+    name: '⚔️ 战士', color: '#3498ff', hpMax: 120,
+    moveSpeed: 4.5, jumpForce: -16, w: 28, h: 38,
+    attacks: {
+      normal: { name: '横斩', dmg: 12, range: 55, knockback: 5, cd: 22, duration: 14 },
+      skill1: { name: '旋风跳', dmg: 18, range: 70, knockback: 7, cd: 220, duration: 40, spinJump: true },
+      skill2: { name: '冲刺斩', dmg: 20, range: 80, knockback: 10, cd: 300, duration: 20, dash: true },
+    },
+    draw(ctx, e) { drawWarrior(ctx, e); },
+  },
+  golem: {
+    name: '🪨 石巨人', color: '#7a6a55', hpMax: 200,
+    moveSpeed: 2.8, jumpForce: -12, w: 40, h: 52,
+    attacks: {
+      normal: { name: '砸拳', dmg: 18, range: 50, knockback: 8, cd: 35, duration: 20 },
+      skill1: { name: '投石', dmg: 25, range: 360, knockback: 6, cd: 360, duration: 12, projectile: true },
+      skill2: { name: '地震踏', dmg: 22, range: 160, knockback: 10, cd: 400, duration: 30, quake: true },
+    },
+    draw(ctx, e) { drawGolem(ctx, e); },
+  },
+  shadow: {
+    name: '🗡️ 影刺', color: '#9b59b6', hpMax: 80,
+    moveSpeed: 6.0, jumpForce: -17, w: 24, h: 36,
+    attacks: {
+      normal: { name: '连刺', dmg: 8,  range: 40, knockback: 3, cd: 15, duration: 10, hits: 2 },
+      skill1: { name: '闪现', dmg: 14, range: 180, knockback: 5, cd: 280, duration: 8, blink: true },
+      skill2: { name: '背刺', dmg: 24, range: 40,  knockback: 8, cd: 350, duration: 12, backstab: true },
+    },
+    draw(ctx, e) { drawShadow(ctx, e); },
+  },
+  mage: {
+    name: '🔮 法师', color: '#1abc9c', hpMax: 90,
+    moveSpeed: 3.8, jumpForce: -15, w: 26, h: 38,
+    attacks: {
+      normal: { name: '魔法弹', dmg: 10, range: 500, knockback: 3, cd: 28, duration: 8, projectile: true },
+      skill1: { name: '寒冰锁', dmg: 8,  range: 300, knockback: 2, cd: 320, duration: 12, freeze: true },
+      skill2: { name: '电球',   dmg: 16, range: 400, knockback: 5, cd: 380, duration: 10, bounce: true },
+    },
+    draw(ctx, e) { drawMage(ctx, e); },
+  },
+  archer: {
+    name: '🏹 神射手', color: '#e67e22', hpMax: 95,
+    moveSpeed: 4.2, jumpForce: -15, w: 26, h: 36,
+    attacks: {
+      normal: { name: '箭矢', dmg: 12, range: 600, knockback: 4, cd: 24, duration: 8, projectile: true },
+      skill1: { name: '穿透箭', dmg: 20, range: 800, knockback: 6, cd: 300, duration: 10, pierce: true },
+      skill2: { name: '后跳射', dmg: 15, range: 600, knockback: 5, cd: 260, duration: 12, backjump: true },
+    },
+    draw(ctx, e) { drawArcher(ctx, e); },
+  },
+};
+const CHAR_KEYS = Object.keys(CHAR_DEFS);
+
+// ─── 游戏状态 ────────────────────────────────────────
+let gameState = 'select'; // 'select' | 'playing' | 'result'
+let playerCharKey = 'warrior';
+let entities = [];    // 所有角色实例
+let projectiles = []; // 飞行道具
+let effects = [];     // 视觉特效
+let hazards = [];     // 落石/蝙蝠等环境机关
+let hazardTimer = 0;
+let resultMsg = '';
+let resultTimer = 0;
+let frameCount = 0;
+
+// ─── Entity 工厂 ─────────────────────────────────────
+function makeEntity(charKey, x, y, isPlayer, id) {
+  const def = CHAR_DEFS[charKey];
+  return {
+    id, charKey, isPlayer,
+    x, y, vx: 0, vy: 0,
+    w: def.w, h: def.h,
+    hp: def.hpMax, hpMax: def.hpMax,
+    dir: isPlayer ? 1 : -1,
+    onGround: false,
+    attacking: 0,  // 攻击持续帧
+    attackType: null,
+    attackCd: { normal: 0, skill1: 0, skill2: 0 },
+    stunTime: 0,
+    frozenTime: 0,
+    dashVx: 0,
+    alive: true,
+    // AI 状态
+    ai: isPlayer ? null : {
+      state: 'hunt', // hunt / retreat / jump
+      target: null,
+      actionCd: 0,
+      jumpCd: 0,
+    },
+  };
+}
+
+// ─── 选角界面 ─────────────────────────────────────────
+const SELECT_BOX_W = 180, SELECT_BOX_H = 230;
+function drawSelectScreen() {
+  // 背景
+  const grad = ctx.createLinearGradient(0, 0, 0, H);
+  grad.addColorStop(0, '#0a0510'); grad.addColorStop(1, '#1a1030');
+  ctx.fillStyle = grad; ctx.fillRect(0, 0, W, H);
+  // 标题
+  ctx.fillStyle = '#fff';
+  ctx.font = `bold ${Math.floor(H * 0.08)}px sans-serif`;
+  ctx.textAlign = 'center';
+  ctx.fillText('⚔️ 小人大乱斗', W/2, H * 0.14);
+  ctx.font = `${Math.floor(H * 0.035)}px sans-serif`;
+  ctx.fillStyle = '#aaa';
+  ctx.fillText('选择你的角色', W/2, H * 0.21);
+
+  const total = CHAR_KEYS.length;
+  const totalW = total * SELECT_BOX_W + (total - 1) * 20;
+  const startX = (W - totalW) / 2;
+  const bY = H * 0.28;
+  const bH = Math.min(SELECT_BOX_H, H * 0.52);
+  const bW = Math.min(SELECT_BOX_W, W / total - 20);
+
+  CHAR_KEYS.forEach((key, i) => {
+    const def = CHAR_DEFS[key];
+    const bX = startX + i * (bW + 20);
+    const selected = playerCharKey === key;
+    // 卡片
+    ctx.fillStyle = selected ? 'rgba(255,255,255,0.15)' : 'rgba(255,255,255,0.05)';
+    ctx.fillRect(bX, bY, bW, bH);
+    ctx.strokeStyle = selected ? def.color : 'rgba(255,255,255,0.2)';
+    ctx.lineWidth = selected ? 3 : 1;
+    ctx.strokeRect(bX, bY, bW, bH);
+    ctx.lineWidth = 1;
+    // 角色图标
+    ctx.fillStyle = def.color;
+    ctx.beginPath();
+    ctx.arc(bX + bW/2, bY + bH * 0.28, bH * 0.16, 0, Math.PI*2);
+    ctx.fill();
+    ctx.fillStyle = '#fff';
+    ctx.font = `${Math.floor(bH * 0.2)}px sans-serif`;
+    ctx.textAlign = 'center';
+    ctx.fillText(def.name.split(' ')[0], bX + bW/2, bY + bH * 0.28 + bH * 0.08);
+    // 名字
+    ctx.fillStyle = selected ? '#fff' : '#ccc';
+    ctx.font = `bold ${Math.floor(bH * 0.1)}px sans-serif`;
+    ctx.fillText(def.name.split(' ').slice(1).join(' ') || def.name, bX + bW/2, bY + bH * 0.5);
+    // HP
+    ctx.fillStyle = '#aaa';
+    ctx.font = `${Math.floor(bH * 0.08)}px sans-serif`;
+    ctx.fillText(`❤️ ${def.hpMax}`, bX + bW/2, bY + bH * 0.63);
+    ctx.fillText(`⚡ ${def.moveSpeed}`, bX + bW/2, bY + bH * 0.74);
+    // 技能
+    ctx.fillStyle = '#888';
+    ctx.font = `${Math.floor(bH * 0.072)}px sans-serif`;
+    ctx.fillText('J: ' + def.attacks.normal.name, bX + bW/2, bY + bH * 0.84);
+    ctx.fillText('K: ' + def.attacks.skill1.name, bX + bW/2, bY + bH * 0.91);
+    ctx.fillText('L: ' + def.attacks.skill2.name, bX + bW/2, bY + bH * 0.98);
+    if (selected) {
+      ctx.fillStyle = def.color;
+      ctx.font = `bold ${Math.floor(bH * 0.09)}px sans-serif`;
+      ctx.fillText('▼ 已选择', bX + bW/2, bY + bH * 1.06);
+    }
+  });
+
+  // 开始提示
+  ctx.fillStyle = '#fff';
+  ctx.font = `${Math.floor(H * 0.04)}px sans-serif`;
+  ctx.textAlign = 'center';
+  ctx.fillText('← → 切换角色    Enter / 空格 开始', W/2, H * 0.92);
+  ctx.fillStyle = '#555';
+  ctx.font = `${Math.floor(H * 0.025)}px sans-serif`;
+  ctx.fillText('点击角色卡片也可以选择', W/2, H * 0.96);
+}
+
+// ─── 地图绘制 ─────────────────────────────────────────
+function drawMap() {
+  // 峡谷背景
+  const bg = ctx.createLinearGradient(0, 0, 0, H);
+  bg.addColorStop(0, '#1a1218'); bg.addColorStop(0.6, '#2a1f30'); bg.addColorStop(1, '#0a0810');
+  ctx.fillStyle = bg; ctx.fillRect(0, 0, W, H);
+
+  // 石窟顶部乳石
+  ctx.fillStyle = '#1e1620';
+  for (let k = 0; k < 12; k++) {
+    const sx = (k * 107) % BASE_W;
+    const sh = 40 + (k * 31) % 60;
+    ctx.beginPath();
+    ctx.moveTo(sx * scaleX, 0);
+    ctx.lineTo((sx + 30) * scaleX, sh * scaleY);
+    ctx.lineTo((sx + 60) * scaleX, 0);
+    ctx.closePath(); ctx.fill();
+  }
+
+  // 背景峡谷墙
+  ctx.fillStyle = '#1a1020';
+  ctx.fillRect(0, BASE_H * 0.3 * scaleY, 60 * scaleX, BASE_H * 0.7 * scaleY);
+  ctx.fillRect((BASE_W - 60) * scaleX, BASE_H * 0.3 * scaleY, 60 * scaleX, BASE_H * 0.7 * scaleY);
+
+  // 中间出界缺口深渊
+  ctx.fillStyle = '#050308';
+  ctx.fillRect(340 * scaleX, 540 * scaleY, 520 * scaleX, 110 * scaleY);
+  // 深渊发光边缘
+  ctx.strokeStyle = 'rgba(150,0,200,0.4)';
+  ctx.lineWidth = 2;
+  ctx.strokeRect(340 * scaleX, 540 * scaleY, 520 * scaleX, 4);
+  ctx.lineWidth = 1;
+
+  // 平台
+  for (const p of PLATFORMS) {
+    if (p.type === 'ground') {
+      // 岩石地面
+      const gg = ctx.createLinearGradient(0, p.y * scaleY, 0, (p.y + p.h) * scaleY);
+      gg.addColorStop(0, '#4a3a2a'); gg.addColorStop(1, '#2a1a10');
+      ctx.fillStyle = gg;
+      ctx.fillRect(p.x * scaleX, p.y * scaleY, p.w * scaleX, p.h * scaleY);
+      // 顶面纹路
+      ctx.fillStyle = '#5a4a3a';
+      ctx.fillRect(p.x * scaleX, p.y * scaleY, p.w * scaleX, 4 * scaleY);
+      // 碎石
+      ctx.fillStyle = '#3a2a1a';
+      for (let k = 0; k < 5; k++) {
+        const rx = (p.x + k * p.w / 5 + 15) * scaleX;
+        const ry = (p.y + 8) * scaleY;
+        ctx.fillRect(rx, ry, 8 * scaleX, 4 * scaleY);
+      }
+    } else if (p.type === 'rock') {
+      ctx.fillStyle = '#3d3028';
+      ctx.fillRect(p.x * scaleX, p.y * scaleY, p.w * scaleX, p.h * scaleY);
+      ctx.fillStyle = '#5a4a38';
+      ctx.fillRect(p.x * scaleX, p.y * scaleY, p.w * scaleX, 3 * scaleY);
+    } else if (p.type === 'ruin') {
+      // 废墟平台 —— 灰褐带破碎缺口感
+      ctx.fillStyle = '#382d38';
+      ctx.fillRect(p.x * scaleX, p.y * scaleY, p.w * scaleX, p.h * scaleY);
+      ctx.fillStyle = '#6a5060';
+      ctx.fillRect(p.x * scaleX, p.y * scaleY, p.w * scaleX, 3 * scaleY);
+      // 缺角
+      ctx.fillStyle = '#0a0810';
+      ctx.fillRect((p.x + p.w - 14) * scaleX, p.y * scaleY, 14 * scaleX, 10 * scaleY);
+    }
+  }
+}
+
+// ─── 角色绘制函数 ─────────────────────────────────────
+function drawHuman(ctx, e, bodyColor, headColor) {
+  const x = e.x * scaleX, y = e.y * scaleY;
+  const w = e.w * scaleX, h = e.h * scaleY;
+  const dir = e.dir;
+  const atk = e.attacking > 0;
+  // 影子
+  ctx.fillStyle = 'rgba(0,0,0,0.4)';
+  ctx.beginPath();
+  ctx.ellipse(x, (e.y + e.h + 2) * scaleY, w * 0.5, 4 * scaleY, 0, 0, Math.PI*2);
+  ctx.fill();
+  // 腿（走路摆动）
+  const legPhase = frameCount * 0.2;
+  const legSwing = e.onGround && (Math.abs(e.vx) > 0.2) ? Math.sin(legPhase) * 6 * scaleY : 0;
+  ctx.fillStyle = bodyColor;
+  ctx.fillRect(x - w*0.22, y + h*0.58 + legSwing, w*0.2, h*0.38);
+  ctx.fillRect(x + w*0.02, y + h*0.58 - legSwing, w*0.2, h*0.38);
+  // 身体
+  ctx.fillStyle = bodyColor;
+  ctx.fillRect(x - w*0.4, y + h*0.28, w*0.8, h*0.4);
+  // 头
+  ctx.fillStyle = headColor;
+  ctx.beginPath();
+  ctx.arc(x, y + h*0.15, w*0.38, 0, Math.PI*2);
+  ctx.fill();
+  // 攻击手臂延伸
+  if (atk) {
+    ctx.fillStyle = headColor;
+    ctx.fillRect(x + dir*w*0.3, y + h*0.35, dir*w*0.6, h*0.12);
+  }
+  // 伤害状态闪红
+  if (e.stunTime > 0) {
+    ctx.fillStyle = 'rgba(255,0,0,0.4)';
+    ctx.fillRect(x - w/2, y, w, h);
+  }
+  if (e.frozenTime > 0) {
+    ctx.fillStyle = 'rgba(100,200,255,0.45)';
+    ctx.fillRect(x - w/2, y, w, h);
+  }
+  // 玩家标识
+  if (e.isPlayer) {
+    ctx.fillStyle = '#ffe066';
+    ctx.font = `${Math.max(10, 11 * Math.min(scaleX, scaleY))}px sans-serif`;
+    ctx.textAlign = 'center';
+    ctx.fillText('▼', x, (e.y - 10) * scaleY);
+  }
+}
+
+function drawWarrior(ctx, e) {
+  drawHuman(ctx, e, '#2260a8', '#ffd4a3');
+  // 剑
+  const dir = e.dir;
+  const x = e.x * scaleX, y = e.y * scaleY, h = e.h * scaleY, w = e.w * scaleX;
+  const swing = e.attacking > 0 ? dir * 0.6 : 0;
+  ctx.save();
+  ctx.translate(x + dir*w*0.3, y + h*0.35);
+  ctx.rotate(swing);
+  ctx.fillStyle = '#c8c8c8';
+  ctx.fillRect(0, -3*scaleY, dir*28*scaleX, 4*scaleY);
+  ctx.fillStyle = '#d4af37';
+  ctx.fillRect(-4*scaleX, -5*scaleY, 8*scaleX, 8*scaleY);
+  ctx.restore();
+}
+function drawGolem(ctx, e) {
+  const x = e.x * scaleX, y = e.y * scaleY;
+  const w = e.w * scaleX, h = e.h * scaleY;
+  ctx.fillStyle = '#2a2a2a';
+  ctx.fillRect(x - w*0.4, y + h*0.6, w*0.8, h*0.4); // 腿
+  ctx.fillStyle = '#4a3f30';
+  ctx.fillRect(x - w*0.48, y + h*0.25, w*0.96, h*0.46); // 体
+  ctx.fillStyle = '#5a4f40';
+  ctx.beginPath();
+  ctx.arc(x, y + h*0.15, w*0.45, 0, Math.PI*2); ctx.fill(); // 头
+  // 纹路
+  ctx.strokeStyle = '#2a1a10'; ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  ctx.moveTo(x - w*0.2, y + h*0.3); ctx.lineTo(x + w*0.2, y + h*0.55);
+  ctx.stroke(); ctx.lineWidth = 1;
+  // 眼
+  ctx.fillStyle = '#ff4400';
+  ctx.fillRect(x - w*0.18, y + h*0.1, w*0.12, w*0.12);
+  ctx.fillRect(x + w*0.06, y + h*0.1, w*0.12, w*0.12);
+  if (e.stunTime > 0) { ctx.fillStyle = 'rgba(255,0,0,0.4)'; ctx.fillRect(x - w/2, y, w, h); }
+  if (e.frozenTime > 0) { ctx.fillStyle = 'rgba(100,200,255,0.45)'; ctx.fillRect(x - w/2, y, w, h); }
+}
+function drawShadow(ctx, e) {
+  const x = e.x * scaleX, y = e.y * scaleY;
+  const w = e.w * scaleX, h = e.h * scaleY;
+  ctx.globalAlpha = 0.92;
+  drawHuman(ctx, e, '#5a2a7a', '#2a1a3a');
+  ctx.globalAlpha = 1;
+  // 匕首
+  const dir = e.dir;
+  ctx.fillStyle = '#cce8ff';
+  ctx.fillRect(x + dir*w*0.2, y + h*0.38, dir*22*scaleX, 3*scaleY);
+  if (e.stunTime > 0) { ctx.fillStyle = 'rgba(255,0,0,0.4)'; ctx.fillRect(x - w/2, y, w, h); }
+  if (e.frozenTime > 0) { ctx.fillStyle = 'rgba(100,200,255,0.45)'; ctx.fillRect(x - w/2, y, w, h); }
+}
+function drawMage(ctx, e) {
+  drawHuman(ctx, e, '#1a6a5a', '#c8e8ff');
+  const x = e.x * scaleX, y = e.y * scaleY;
+  const w = e.w * scaleX, h = e.h * scaleY;
+  // 法杖
+  ctx.fillStyle = '#8a5a2a';
+  ctx.fillRect(x + e.dir*w*0.2, y + h*0.2, e.dir*5*scaleX, h*0.55);
+  ctx.fillStyle = '#00eeff';
+  ctx.beginPath();
+  ctx.arc(x + e.dir*(w*0.22 + 2*scaleX), y + h*0.18, 6*scaleX, 0, Math.PI*2);
+  ctx.fill();
+  if (e.stunTime > 0) { ctx.fillStyle = 'rgba(255,0,0,0.4)'; ctx.fillRect(x - w/2, y, w, h); }
+  if (e.frozenTime > 0) { ctx.fillStyle = 'rgba(100,200,255,0.45)'; ctx.fillRect(x - w/2, y, w, h); }
+}
+function drawArcher(ctx, e) {
+  drawHuman(ctx, e, '#8a4010', '#ffd4a3');
+  const x = e.x * scaleX, y = e.y * scaleY;
+  const w = e.w * scaleX, h = e.h * scaleY;
+  // 弓
+  const dir = e.dir;
+  ctx.strokeStyle = '#8a6030'; ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.arc(x + dir*6*scaleX, y + h*0.35, 12*scaleY, -Math.PI*0.55, Math.PI*0.55, dir < 0);
+  ctx.stroke(); ctx.lineWidth = 1;
+  if (e.attacking > 0) {
+    ctx.fillStyle = '#ffdd44';
+    ctx.fillRect(x + dir*4*scaleX, y + h*0.34, dir*20*scaleX, 2*scaleY);
+  }
+  if (e.stunTime > 0) { ctx.fillStyle = 'rgba(255,0,0,0.4)'; ctx.fillRect(x - w/2, y, w, h); }
+  if (e.frozenTime > 0) { ctx.fillStyle = 'rgba(100,200,255,0.45)'; ctx.fillRect(x - w/2, y, w, h); }
+}
+
+// ─── 物理 ─────────────────────────────────────────────
+function applyPhysics(e) {
+  if (!e.alive) return;
+  if (e.frozenTime > 0) { e.frozenTime--; return; }
+  e.vy += GRAVITY;
+  e.x += e.vx + e.dashVx;
+  e.y += e.vy;
+  e.dashVx *= 0.7;
+  if (Math.abs(e.dashVx) < 0.1) e.dashVx = 0;
+  e.vx *= 0.82;
+  // 平台碰撞
+  e.onGround = false;
+  for (const p of PLATFORMS) {
+    const prevBottom = e.y + e.h - e.vy;
+    if (e.x + e.w/2 > p.x && e.x - e.w/2 < p.x + p.w &&
+        e.y + e.h >= p.y && prevBottom <= p.y + 4 && e.vy >= 0) {
+      e.y = p.y - e.h;
+      e.vy = 0;
+      e.onGround = true;
+    }
+  }
+  // 出界检测
+  if (e.x < BOUNDS.left || e.x > BOUNDS.right || e.y > BOUNDS.bottom) {
+    e.hp = 0;
+    e.alive = false;
+  }
+}
+
+// ─── 攻击逻辑 ─────────────────────────────────────────
+function doAttack(attacker, atkKey) {
+  const def = CHAR_DEFS[attacker.charKey];
+  const atk = def.attacks[atkKey];
+  if (!atk || attacker.attackCd[atkKey] > 0 || attacker.stunTime > 0 || attacker.frozenTime > 0) return;
+  attacker.attacking = atk.duration;
+  attacker.attackType = atkKey;
+  attacker.attackCd[atkKey] = atk.cd;
+  const dir = attacker.dir;
+
+  // 位移型技能
+  if (atk.dash) {
+    attacker.dashVx = dir * 14;
+    attacker.vy = -5;
+  }
+  if (atk.spinJump) {
+    attacker.vy = -14;
+  }
+  if (atk.backjump) {
+    attacker.vy = -13;
+    attacker.dashVx = -dir * 10;
+  }
+
+  // 射弹型
+  if (atk.projectile || atk.pierce || atk.freeze || atk.bounce) {
+    let spd = 10;
+    if (attacker.charKey === 'golem') spd = 7;
+    const pj = {
+      x: attacker.x + dir * attacker.w, y: attacker.y + attacker.h * 0.35,
+      vx: dir * spd, vy: -1,
+      ownerId: attacker.id, dmg: atk.dmg, knockback: atk.knockback,
+      life: Math.floor(atk.range / spd),
+      pierce: !!atk.pierce,
+      freeze: !!atk.freeze,
+      bounce: !!atk.bounce,
+      bounceCount: atk.bounce ? 3 : 0,
+      charKey: attacker.charKey,
+      type: atkKey,
+    };
+    projectiles.push(pj);
+    return; // 近战伤害在下面
+  }
+
+  // 地震踏
+  if (atk.quake) {
+    effects.push({ type: 'quake', x: attacker.x, y: attacker.y + attacker.h, life: 30, r: 10 });
+    entities.forEach(target => {
+      if (target.id === attacker.id || !target.alive) return;
+      const dist = Math.abs(target.x - attacker.x);
+      if (target.onGround && dist < atk.range) {
+        const ratio = 1 - dist / atk.range;
+        hitEntity(target, attacker, atk.dmg * ratio, atk.knockback * ratio, attacker.dir);
+        target.vy = -8;
+      }
+    });
+    return;
+  }
+
+  // 闪现背刺
+  if (atk.blink) {
+    const target = nearestEnemy(attacker);
+    if (target) {
+      attacker.x = target.x - dir * (attacker.w + 5);
+    }
+  }
+
+  // 近战（含旋风、连刺等）
+  const hits = atk.hits || 1;
+  entities.forEach(target => {
+    if (target.id === attacker.id || !target.alive) return;
+    const dx = (target.x - attacker.x) * dir;
+    const dy = Math.abs(target.y + target.h/2 - (attacker.y + attacker.h/2));
+    if (dx > -10 && dx < atk.range && dy < (attacker.h + target.h) * 0.6) {
+      for (let h = 0; h < hits; h++) {
+        hitEntity(target, attacker, atk.dmg, atk.knockback, dir);
+      }
+      if (atk.backstab && dir !== target.dir) hitEntity(target, attacker, atk.dmg, 4, dir);
+    }
+  });
+}
+
+function nearestEnemy(from) {
+  let best = null, bestD = 9999;
+  entities.forEach(e => {
+    if (e.id === from.id || !e.alive) return;
+    const d = Math.hypot(e.x - from.x, e.y - from.y);
+    if (d < bestD) { bestD = d; best = e; }
+  });
+  return best;
+}
+
+function hitEntity(target, attacker, dmg, knockback, dir) {
+  if (!target.alive || target.stunTime > 4) return;
+  target.hp = Math.max(0, target.hp - Math.ceil(dmg));
+  target.vx = dir * knockback;
+  target.vy = -4;
+  target.stunTime = 14;
+  effects.push({ type: 'hit', x: target.x, y: target.y + target.h/2, life: 12 });
+  if (target.hp <= 0) target.alive = false;
+}
+
+// ─── AI ───────────────────────────────────────────────
+function updateAI(e) {
+  if (!e.ai || !e.alive) return;
+  const ai = e.ai;
+  if (ai.actionCd > 0) { ai.actionCd--; return; }
+  // 找最近目标（优先玩家）
+  const target = entities.find(en => en.isPlayer && en.alive) || nearestEnemy(e);
+  if (!target) return;
+  const dx = target.x - e.x;
+  const dist = Math.abs(dx);
+  e.dir = dx > 0 ? 1 : -1;
+
+  const def = CHAR_DEFS[e.charKey];
+  const hp_ratio = e.hp / e.hpMax;
+
+  // 远程角色保持距离
+  const preferRange = ['mage', 'archer'].includes(e.charKey);
+  const safeRange = preferRange ? 280 : 80;
+
+  // 跳跃
+  if (ai.jumpCd <= 0 && e.onGround) {
+    if (target.y < e.y - 60) { // 目标在更高平台
+      e.vy = def.jumpForce;
+      ai.jumpCd = 60;
+    } else if (Math.random() < 0.015) { // 随机跳跃
+      e.vy = def.jumpForce;
+      ai.jumpCd = 80;
+    }
+  }
+  if (ai.jumpCd > 0) ai.jumpCd--;
+
+  // 移动
+  if (dist > safeRange) {
+    e.vx = e.dir * def.moveSpeed * 0.8;
+  } else if (preferRange && dist < safeRange * 0.5) {
+    e.vx = -e.dir * def.moveSpeed * 0.6; // 拉开距离
+  }
+
+  // 攻击决策
+  const atkDefs = def.attacks;
+  if (dist < atkDefs.normal.range + 20 && e.attackCd.normal <= 0) {
+    doAttack(e, 'normal');
+    ai.actionCd = 20 + Math.floor(Math.random() * 30);
+  } else if (e.attackCd.skill1 <= 0 && Math.random() < 0.02) {
+    doAttack(e, 'skill1');
+    ai.actionCd = 30;
+  } else if (e.attackCd.skill2 <= 0 && hp_ratio < 0.5 && Math.random() < 0.015) {
+    doAttack(e, 'skill2');
+    ai.actionCd = 30;
+  }
+}
+
+// ─── 输入 ─────────────────────────────────────────────
+const keys = {};
+window.addEventListener('keydown', e => {
+  const k = e.key.toLowerCase();
+  keys[k] = true;
+
+  if (gameState === 'select') {
+    if (k === 'arrowleft' || k === 'a') {
+      const i = CHAR_KEYS.indexOf(playerCharKey);
+      playerCharKey = CHAR_KEYS[(i - 1 + CHAR_KEYS.length) % CHAR_KEYS.length];
+    } else if (k === 'arrowright' || k === 'd') {
+      const i = CHAR_KEYS.indexOf(playerCharKey);
+      playerCharKey = CHAR_KEYS[(i + 1) % CHAR_KEYS.length];
+    } else if (k === 'enter' || k === ' ') {
+      startGame();
+    }
+    return;
+  }
+
+  if (gameState === 'result' || (gameState === 'playing' && (k === 'r'))) {
+    gameState = 'select';
+    return;
+  }
+
+  if (gameState !== 'playing') return;
+  const player = entities.find(e => e.isPlayer);
+  if (!player || !player.alive) return;
+
+  const def = CHAR_DEFS[player.charKey];
+  if ((k === 'w' || k === 'arrowup') && player.onGround) {
+    player.vy = def.jumpForce;
+  }
+  if (k === 'j') doAttack(player, 'normal');
+  if (k === 'k') doAttack(player, 'skill1');
+  if (k === 'l') doAttack(player, 'skill2');
+});
+window.addEventListener('keyup', e => { keys[e.key.toLowerCase()] = false; });
+
+// 选角点击
+cv.addEventListener('click', ev => {
+  if (gameState !== 'select') return;
+  const total = CHAR_KEYS.length;
+  const bW = Math.min(SELECT_BOX_W, W / total - 20);
+  const bH = Math.min(SELECT_BOX_H, H * 0.52);
+  const totalW = total * bW + (total - 1) * 20;
+  const startX = (W - totalW) / 2;
+  const bY = H * 0.28;
+  CHAR_KEYS.forEach((key, i) => {
+    const bX = startX + i * (bW + 20);
+    if (ev.clientX >= bX && ev.clientX <= bX + bW && ev.clientY >= bY && ev.clientY <= bY + bH * 1.1) {
+      if (playerCharKey === key) startGame();
+      else playerCharKey = key;
+    }
+  });
+});
+
+// ─── 开始游戏 ─────────────────────────────────────────
+function startGame() {
+  entities = [];
+  projectiles = [];
+  effects = [];
+  hazards = [];
+  hazardTimer = 0;
+  frameCount = 0;
+
+  // 玩家
+  entities.push(makeEntity(playerCharKey, 200, 460, true, 0));
+
+  // 3 个 AI 对手（随机挑 3 个不同角色）
+  const others = CHAR_KEYS.filter(k => k !== playerCharKey);
+  const aiKeys = others.sort(() => Math.random() - 0.5).slice(0, 3);
+  const spawnX = [600, 850, 400];
+  aiKeys.forEach((key, i) => {
+    entities.push(makeEntity(key, spawnX[i], 460, false, i + 1));
+  });
+
+  buildHUD();
+  gameState = 'playing';
+}
+
+function buildHUD() {
+  const hud = document.getElementById('hud');
+  hud.innerHTML = '';
+  entities.forEach(e => {
+    const def = CHAR_DEFS[e.charKey];
+    const div = document.createElement('div');
+    div.className = 'char-hud';
+    div.id = `hud-${e.id}`;
+    div.innerHTML = `
+      <div class="name" style="color:${e.isPlayer ? '#ffe066' : '#ccc'}">${e.isPlayer ? '▼ ' : ''}${def.name}</div>
+      <div class="hp-bar"><div class="hp-fill" id="hp-fill-${e.id}" style="width:100%;background:${def.color}"></div></div>
+      <div class="hp-text" id="hp-text-${e.id}">${e.hp}/${e.hpMax}</div>
+    `;
+    hud.appendChild(div);
+  });
+}
+
+function updateHUD() {
+  entities.forEach(e => {
+    const fill = document.getElementById(`hp-fill-${e.id}`);
+    const text = document.getElementById(`hp-text-${e.id}`);
+    if (!fill) return;
+    const ratio = Math.max(0, e.hp / e.hpMax) * 100;
+    fill.style.width = ratio + '%';
+    if (text) text.textContent = e.alive ? `${e.hp}/${e.hpMax}` : '💀';
+  });
+}
+
+// ─── 环境机关 ──────────────────────────────────────────
+function spawnHazard() {
+  const type = Math.random() < 0.6 ? 'rock' : 'bat';
+  if (type === 'rock') {
+    hazards.push({
+      type: 'rock',
+      x: 100 + Math.random() * 1000,
+      y: -40, vy: 2, dmg: 10, r: 16, life: 400,
+    });
+  } else {
+    hazards.push({
+      type: 'bat',
+      x: Math.random() < 0.5 ? -40 : BASE_W + 40,
+      y: 180 + Math.random() * 200,
+      vx: Math.random() < 0.5 ? 3.5 : -3.5,
+      dmg: 8, r: 14, life: 180,
+    });
+  }
+}
+
+function updateHazards() {
+  hazardTimer++;
+  if (hazardTimer % 200 === 0) spawnHazard();
+  for (let i = hazards.length - 1; i >= 0; i--) {
+    const h = hazards[i];
+    h.life--;
+    if (h.type === 'rock') {
+      h.vy += 0.3; h.y += h.vy;
+      if (h.y > BASE_H + 60) { hazards.splice(i, 1); continue; }
+    } else {
+      h.x += h.vx;
+      if (h.x < -80 || h.x > BASE_W + 80) { hazards.splice(i, 1); continue; }
+    }
+    if (h.life <= 0) { hazards.splice(i, 1); continue; }
+    // 碰到角色
+    entities.forEach(e => {
+      if (!e.alive) return;
+      if (Math.hypot(e.x - h.x, (e.y + e.h/2) - h.y) < h.r + e.w/2) {
+        hitEntity(e, null, h.dmg, 3, h.vx >= 0 ? 1 : -1);
+        hazards.splice(i, 1);
+      }
+    });
+  }
+}
+
+function drawHazards() {
+  for (const h of hazards) {
+    const hx = h.x * scaleX, hy = h.y * scaleY;
+    if (h.type === 'rock') {
+      ctx.fillStyle = '#5a4a3a';
+      ctx.beginPath(); ctx.arc(hx, hy, h.r * scaleX, 0, Math.PI*2); ctx.fill();
+      ctx.fillStyle = '#3a2a1a';
+      ctx.fillRect(hx - 5*scaleX, hy - 3*scaleY, 4*scaleX, 3*scaleY);
+      // 警告线
+      ctx.strokeStyle = 'rgba(255,200,0,0.5)';
+      ctx.setLineDash([4, 4]);
+      ctx.beginPath(); ctx.moveTo(hx, 0); ctx.lineTo(hx, hy - h.r * scaleY);
+      ctx.stroke(); ctx.setLineDash([]);
+    } else {
+      ctx.fillStyle = '#2a1a3a';
+      ctx.beginPath(); ctx.ellipse(hx, hy, h.r * scaleX, 8 * scaleY, 0, 0, Math.PI*2); ctx.fill();
+      const wf = Math.sin(Date.now() / 80) * 4 * scaleY;
+      ctx.beginPath();
+      ctx.moveTo(hx - 8*scaleX, hy); ctx.lineTo(hx - 20*scaleX, hy - 6*scaleY + wf);
+      ctx.lineTo(hx - 12*scaleX, hy + 4*scaleY);
+      ctx.closePath(); ctx.fill();
+      ctx.beginPath();
+      ctx.moveTo(hx + 8*scaleX, hy); ctx.lineTo(hx + 20*scaleX, hy - 6*scaleY + wf);
+      ctx.lineTo(hx + 12*scaleX, hy + 4*scaleY);
+      ctx.closePath(); ctx.fill();
+      ctx.fillStyle = '#ff4444';
+      ctx.fillRect(hx - 8*scaleX, hy - 4*scaleY, 3*scaleX, 3*scaleY);
+      ctx.fillRect(hx + 5*scaleX, hy - 4*scaleY, 3*scaleX, 3*scaleY);
+    }
+  }
+}
+
+// ─── 投射物 ───────────────────────────────────────────
+function updateProjectiles() {
+  for (let i = projectiles.length - 1; i >= 0; i--) {
+    const p = projectiles[i];
+    p.x += p.vx; p.y += p.vy;
+    p.life--;
+    if (p.life <= 0) { projectiles.splice(i, 1); continue; }
+    // 平台碰撞
+    let hitPlatform = false;
+    for (const pl of PLATFORMS) {
+      if (p.x > pl.x && p.x < pl.x + pl.w && p.y + 4 >= pl.y && p.y < pl.y + pl.h) {
+        hitPlatform = true;
+        break;
+      }
+    }
+    if (hitPlatform && !p.pierce) {
+      if (p.bounce && p.bounceCount > 0) {
+        p.vy = -Math.abs(p.vy) * 0.9;
+        p.bounceCount--;
+      } else {
+        effects.push({ type: 'hit', x: p.x, y: p.y, life: 10 });
+        projectiles.splice(i, 1);
+        continue;
+      }
+    }
+    // 命中角色
+    let spliced = false;
+    for (const target of entities) {
+      if (target.id === p.ownerId || !target.alive) continue;
+      if (Math.abs(target.x - p.x) < target.w/2 + 8 && Math.abs(target.y + target.h/2 - p.y) < target.h/2 + 8) {
+        if (p.freeze) target.frozenTime = 90;
+        hitEntity(target, null, p.dmg, p.knockback, p.vx > 0 ? 1 : -1);
+        effects.push({ type: 'hit', x: p.x, y: p.y, life: 12 });
+        if (!p.pierce) { projectiles.splice(i, 1); spliced = true; break; }
+      }
+    }
+    if (!spliced) p.vy += 0.18; // 重力微弱
+  }
+}
+
+function drawProjectiles() {
+  for (const p of projectiles) {
+    const px = p.x * scaleX, py = p.y * scaleY;
+    if (p.charKey === 'mage' || p.type === 'skill1') {
+      ctx.fillStyle = p.freeze ? '#44eeff' : '#1abc9c';
+      ctx.beginPath(); ctx.arc(px, py, 8 * scaleX, 0, Math.PI*2); ctx.fill();
+      ctx.fillStyle = '#fff';
+      ctx.beginPath(); ctx.arc(px - 2*scaleX, py - 2*scaleY, 3 * scaleX, 0, Math.PI*2); ctx.fill();
+    } else if (p.charKey === 'archer') {
+      ctx.strokeStyle = '#ffdd44'; ctx.lineWidth = 2.5;
+      ctx.beginPath();
+      ctx.moveTo(px - p.vx * scaleX * 2.5, py - p.vy * scaleY * 2.5);
+      ctx.lineTo(px, py);
+      ctx.stroke(); ctx.lineWidth = 1;
+    } else if (p.charKey === 'golem') {
+      ctx.fillStyle = '#5a4a3a';
+      ctx.beginPath(); ctx.arc(px, py, 12 * scaleX, 0, Math.PI*2); ctx.fill();
+    }
+    if (p.bounce) {
+      ctx.fillStyle = '#ffee00';
+      ctx.beginPath(); ctx.arc(px, py, 8 * scaleX, 0, Math.PI*2); ctx.fill();
+    }
+  }
+}
+
+// ─── 特效 ─────────────────────────────────────────────
+function updateEffects() {
+  for (let i = effects.length - 1; i >= 0; i--) {
+    effects[i].life--;
+    if (effects[i].type === 'quake') effects[i].r += 6;
+    if (effects[i].life <= 0) effects.splice(i, 1);
+  }
+}
+
+function drawEffects() {
+  for (const ef of effects) {
+    if (ef.type === 'hit') {
+      const alpha = ef.life / 12;
+      ctx.strokeStyle = `rgba(255,220,80,${alpha})`;
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.arc(ef.x * scaleX, ef.y * scaleY, (12 - ef.life) * 2 * scaleX, 0, Math.PI*2);
+      ctx.stroke(); ctx.lineWidth = 1;
+    } else if (ef.type === 'quake') {
+      ctx.fillStyle = `rgba(180,120,40,${ef.life / 30 * 0.4})`;
+      ctx.beginPath();
+      ctx.ellipse(ef.x * scaleX, ef.y * scaleY, ef.r * scaleX, 12 * scaleY, 0, 0, Math.PI*2);
+      ctx.fill();
+    }
+  }
+}
+
+// ─── 主要 update ─────────────────────────────────────
+function update() {
+  if (gameState !== 'playing') return;
+  frameCount++;
+
+  // 玩家移动
+  const player = entities.find(e => e.isPlayer && e.alive);
+  if (player) {
+    const def = CHAR_DEFS[player.charKey];
+    if ((keys['a'] || keys['arrowleft']) && player.stunTime <= 0) {
+      player.vx = -def.moveSpeed; player.dir = -1;
+    } else if ((keys['d'] || keys['arrowright']) && player.stunTime <= 0) {
+      player.vx = def.moveSpeed; player.dir = 1;
+    }
+  }
+
+  // CD 倒数 + 状态倒数
+  entities.forEach(e => {
+    if (!e.alive) return;
+    ['normal', 'skill1', 'skill2'].forEach(k => { if (e.attackCd[k] > 0) e.attackCd[k]--; });
+    if (e.attacking > 0) e.attacking--;
+    if (e.stunTime > 0) e.stunTime--;
+    applyPhysics(e);
+    updateAI(e);
+  });
+
+  updateHazards();
+  updateProjectiles();
+  updateEffects();
+  updateHUD();
+
+  // 胜负判断
+  const alive = entities.filter(e => e.alive);
+  if (alive.length <= 1) {
+    if (alive.length === 1) {
+      const winner = alive[0];
+      const def = CHAR_DEFS[winner.charKey];
+      resultMsg = winner.isPlayer
+        ? `🎉 你赢了！${def.name} 是最后的胜者！`
+        : `💀 ${def.name} 赢了！按 R 重新开始`;
+    } else {
+      resultMsg = '🤝 平局！按 R 重新开始';
+    }
+    gameState = 'result';
+  }
+}
+
+// ─── 绘制 ─────────────────────────────────────────────
+function draw() {
+  ctx.clearRect(0, 0, W, H);
+
+  if (gameState === 'select') {
+    drawSelectScreen();
+    return;
+  }
+
+  drawMap();
+  drawHazards();
+  drawEffects();
+
+  // 角色
+  entities.forEach(e => {
+    if (!e.alive) return;
+    CHAR_DEFS[e.charKey].draw(ctx, e);
+  });
+
+  drawProjectiles();
+
+  // 出界警告区域（半透明紫色）
+  ctx.fillStyle = 'rgba(120,0,180,0.12)';
+  ctx.fillRect(0, 0, 60 * scaleX, H);
+  ctx.fillRect((BASE_W - 60) * scaleX, 0, 60 * scaleX, H);
+
+  // 结果画面
+  if (gameState === 'result') {
+    ctx.fillStyle = 'rgba(0,0,0,0.65)';
+    ctx.fillRect(0, 0, W, H);
+    ctx.fillStyle = '#fff';
+    ctx.font = `bold ${Math.floor(H * 0.07)}px sans-serif`;
+    ctx.textAlign = 'center';
+    ctx.fillText(resultMsg, W/2, H/2);
+    ctx.font = `${Math.floor(H * 0.035)}px sans-serif`;
+    ctx.fillStyle = '#aaa';
+    ctx.fillText('按 R 返回选角', W/2, H/2 + H * 0.1);
+  }
+}
+
+// ─── 主循环 ───────────────────────────────────────────
+function loop() {
+  update();
+  draw();
+  requestAnimationFrame(loop);
+}
+loop();
+</script>
+</body>
+</html>
